@@ -1,0 +1,127 @@
+name: YouTube analytics report
+
+# Runs the analytics tools in GitHub's cloud and uploads an ENCRYPTED report.
+# The repository is public, so nothing from the API is printed to the log: every
+# tool writes into report/, which is encrypted with .github/report-public-key.pem
+# before upload. Only the matching private key (kept off GitHub) can open it.
+on:
+  workflow_dispatch:
+    inputs:
+      video:
+        description: "Video ID or URL (leave empty to search by title)"
+        required: false
+        default: ""
+      title_query:
+        description: "Title search used when no video is given"
+        required: false
+        default: "Siddaramaiah"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: youtube-analytics-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build analytics binary
+        run: go build -trimpath -o yta ./cmd
+
+      - name: Restore OAuth token (contents never printed)
+        env:
+          TOKENS_B64: ${{ secrets.YOUTUBE_TOKENS_JSON_B64 }}
+        run: |
+          if [ -z "$TOKENS_B64" ]; then
+            echo "::error::Secret YOUTUBE_TOKENS_JSON_B64 is not set"; exit 1
+          fi
+          d="$RUNNER_TEMP/yta-data"; mkdir -p "$d"; chmod 700 "$d"
+          printf '%s' "$TOKENS_B64" | base64 -d > "$d/tokens.json"
+          chmod 600 "$d/tokens.json"
+          python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$d/tokens.json"
+          echo "YOUTUBE_ANALYTICS_DATA_DIR=$d" >> "$GITHUB_ENV"
+          echo "Token file restored."
+
+      - name: Collect analytics into report/
+        env:
+          YOUTUBE_OAUTH_CLIENT_ID: ${{ secrets.YOUTUBE_OAUTH_CLIENT_ID }}
+          YOUTUBE_OAUTH_CLIENT_SECRET: ${{ secrets.YOUTUBE_OAUTH_CLIENT_SECRET }}
+          VIDEO: ${{ inputs.video }}
+          QUERY: ${{ inputs.title_query }}
+        run: |
+          set -u
+          mkdir -p report
+          ok=0; failed=0
+          # run <file> <tool> <json args>: output and errors go only into report/
+          run() {
+            if ./yta -tool "$2" -args "$3" > "report/$1.md" 2> "report/$1.err"; then ok=$((ok+1)); else failed=$((failed+1)); fi
+          }
+          jargs() { python3 -c 'import json,sys; a=json.loads(sys.argv[2]); a["video_id"]=sys.argv[1]; print(json.dumps(a))' "$1" "$2"; }
+
+          run 00_channels       list_channels    '{}'
+          run 01_overview_28d   channel_overview '{"period":"28d"}'
+          run 02_overview_90d   channel_overview '{"period":"90d"}'
+          run 03_videos         list_videos      '{"limit":50}'
+          run 04_perf_views_90d video_performance '{"sort":"views","period":"90d","limit":50}'
+          run 05_perf_ctr_90d   video_performance '{"sort":"ctr","period":"90d","limit":50}'
+          run 06_ctr_by_video   impressions_ctr  '{"group_by":"video","period":"90d","refresh":true}'
+          run 07_timeline_90d   timeline         '{"period":"90d","granularity":"day","metrics":["views","estimatedMinutesWatched","subscribersGained","subscribersLost","averageViewPercentage"]}'
+
+          ids=()
+          if [ -n "$VIDEO" ]; then
+            ids=("$VIDEO")
+          else
+            run 08_title_matches list_videos "$(python3 -c 'import json,os; print(json.dumps({"limit":50,"query":os.environ["QUERY"]}))')"
+            mapfile -t ids < <(grep -oE 'ID [A-Za-z0-9_-]{11}' report/08_title_matches.md | awk '{print $2}' | head -3)
+          fi
+
+          for id in "${ids[@]}"; do
+            v="v_$(printf '%s' "$id" | tr -c 'A-Za-z0-9_-' '_')"
+            run "${v}_report"        video_report     "$(jargs "$id" '{"period":"lifetime"}')"
+            run "${v}_retention"     video_retention  "$(jargs "$id" '{"points":100}')"
+            run "${v}_retention_new" video_retention  "$(jargs "$id" '{"subscribed_status":"unsubscribed"}')"
+            run "${v}_traffic"       traffic_sources  "$(jargs "$id" '{"period":"lifetime"}')"
+            run "${v}_search_terms"  traffic_sources  "$(jargs "$id" '{"period":"lifetime","detail_for":"YT_SEARCH"}')"
+            run "${v}_suggested"     traffic_sources  "$(jargs "$id" '{"period":"lifetime","detail_for":"RELATED_VIDEO"}')"
+            run "${v}_ctr_source"    impressions_ctr  "$(jargs "$id" '{"group_by":"traffic_source","period":"lifetime"}')"
+            run "${v}_ctr_daily"     impressions_ctr  "$(jargs "$id" '{"group_by":"day","period":"lifetime"}')"
+            run "${v}_audience"      audience         "$(jargs "$id" '{"period":"lifetime"}')"
+            run "${v}_timeline"      timeline         "$(jargs "$id" '{"period":"28d","granularity":"day"}')"
+          done
+
+          # Log only counts, never data.
+          echo "Videos analysed: ${#ids[@]}; tool calls ok: $ok; failed: $failed"
+          if [ "$ok" -eq 0 ]; then echo "::error::No analytics call succeeded"; exit 1; fi
+
+      - name: Encrypt report
+        run: |
+          key="$(openssl rand -hex 32)"
+          echo "::add-mask::$key"
+          tar czf report.tgz report
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass "pass:$key" -in report.tgz -out report.tgz.enc
+          printf '%s' "$key" | openssl pkeyutl -encrypt -pubin -inkey .github/report-public-key.pem \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -out report.key.enc
+          rm -rf report report.tgz
+          unset key
+
+      - name: Upload encrypted report
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-analytics-report-encrypted
+          path: |
+            report.tgz.enc
+            report.key.enc
+          if-no-files-found: error
+          retention-days: 7
